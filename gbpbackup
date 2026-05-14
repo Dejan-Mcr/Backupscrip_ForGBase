@@ -6,7 +6,7 @@
 # Description           : Backup + Archive lifecycle unified management
 # Version Description   : v4.1 (2026-05-11)
 #     - Fix : lock file PID residual data — truncate cleanly after acquiring lock,
-#             read only first line via head -1; add trap to remove lock file on exit
+#             read only first line via head -1;
 #     - Fix : check_db non-local data_dir variable — return value via explicit
 #             global _GBP_DATA_DIR (stdout carries log output, unsafe to capture)
 #     - Fix : Python heredoc exit codes — distinguish real errors (exit 2) from
@@ -77,7 +77,6 @@ log_retention_time=${log_retention_time:-60}
 # Lock File Definition
 # v3.6 Tag: Changed lock file to local directory
 lock_file="${script_dir}/.gbpbackup.lock"
-
 
 ########################################
 # Detailed Usage Information
@@ -689,7 +688,6 @@ cmd_backup() {
         log_ok "$actual_mode Backup process has been completed. (Local)"
     fi
     log_info "========================================================="
-    trap 'rm -f "$lock_file"' EXIT
 }
 
 # Archive Cleanup with file count statistics
@@ -878,3 +876,4 @@ esac
 log_info "========================================================="
 log_ok " gbpbackup finished at $(date) "
 log_info "========================================================="
+
