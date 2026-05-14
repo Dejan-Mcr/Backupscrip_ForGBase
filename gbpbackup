@@ -1,0 +1,880 @@
+#!/bin/bash
+##################################################################
+# Script Name           : gbpbackup
+# Version               : v4.1
+# Author                : Dengwenjian@gbase.cn
+# Description           : Backup + Archive lifecycle unified management
+# Version Description   : v4.1 (2026-05-11)
+#     - Fix : lock file PID residual data — truncate cleanly after acquiring lock,
+#             read only first line via head -1; add trap to remove lock file on exit
+#     - Fix : check_db non-local data_dir variable — return value via explicit
+#             global _GBP_DATA_DIR (stdout carries log output, unsafe to capture)
+#     - Fix : Python heredoc exit codes — distinguish real errors (exit 2) from
+#             normal "no valid backup" results (exit 1)
+#     - Fix : misleading "Reloading configuration" log message — clarify that
+#             set-config synchronizes in-memory values to gs_probackup
+#     - Fix : monitor_gbpbackup.sh — lock file open < (read-only) for cross-user
+#             flock detection; realpath for robust SCRIPT_DIR; removed $1 parameter
+# Last Updated          : 2026-05-11
+##################################################################
+
+set -euo pipefail
+
+export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+[[ -n "${GAUSSHOME:-}" ]] && export PATH=$GAUSSHOME/bin:$PATH
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+########################################
+# Load Profile Configuration
+# Temporarily relax set -e/-u so that $() expressions or missing commands inside the profile do not abort the script.
+# Any variable not set by the profile will fall through to the defaults defined in the next section.
+########################################
+profile_file="${script_dir}/.gbpbackup_profile"
+if [[ -f "$profile_file" ]]; then
+    set +eu
+    # shellcheck source=.gbpbackup_profile
+    source "$profile_file" || {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SCRIPT] [WARN] : Failed to fully source profile: $profile_file — using built-in defaults for any unset variable" >&2
+    }
+    set -eu
+fi
+
+########################################
+# Default Configuration Values
+# All values use ${var:-default} so a value already exported
+# from the profile takes precedence.
+########################################
+# CPU core count and derived default thread count (ceiling of cores/2, minimum 1)
+cpu_cores=$(nproc 2>/dev/null || echo 2)
+default_threads=$(( (cpu_cores + 1) / 2 ))
+default_threads=$(( default_threads > 1 ? default_threads : 1 ))
+
+backups_dir=${backups_dir:-${script_dir}/backups}
+logs_root=${logs_dir:-${script_dir}/logs}
+retention_redundancy=${retention_redundancy:-2}
+retention_window=${retention_window:-7}
+retention_days=${retention_days:-7}
+backup_threads=${backup_threads:-$default_threads}
+db_port=${db_port:-15400}
+instance_name=${instance_name:-gbase}
+compress_level=${compress_level:-5}
+archive_dir=${archive_dir:-${backups_dir}/wal/${instance_name}}
+
+# v3.4 Tag: Standby backup mode
+is_standby_backup=${is_standby_backup:-false}
+
+# Remote config defaults
+remote_host=${remote_host:-}
+remote_user=${remote_user:-gbase}
+remote_port=${remote_port:-22}
+dbauser=${dbauser:-}
+dbpasswd=${dbpasswd:-}
+
+# v3.5 Tag: Log retention time (days)
+log_retention_time=${log_retention_time:-60}
+
+# Lock File Definition
+# v3.6 Tag: Changed lock file to local directory
+lock_file="${script_dir}/.gbpbackup.lock"
+
+
+########################################
+# Detailed Usage Information
+########################################
+usage() {
+    cat <<EOF
+==================================================================
+ gbpbackup - Unified Backup and Archive Management Tool
+==================================================================
+
+Usage:
+  gbpbackup init [--remote]      Initialize backup repository and instance configuration
+  gbpbackup set-config           Set configuration backup rule settings
+  gbpbackup backup full|increment [--remote]
+                                 Perform a full or incremental backup
+  gbpbackup archive clean        Clean expired WAL archives (retention: ${retention_days} days)
+  gbpbackup delete -i <backupid> Delete specific backup by ID
+  gbpbackup checkexpired         Delete expired backups based on retention policy
+  gbpbackup validate             Verify whether the backup file exists and is normal
+  gbpbackup show                 Show existing backups
+  gbpbackup show-config          Show current configuration
+  gbpbackup show-profile         Show active profile settings
+
+Options:
+  --remote                       Enable remote backup mode (requires remote config)
+
+==================================================================
+Configuration File: $profile_file
+==================================================================
+Local Configuration:
+  backups_dir          : ${backups_dir:-not set}       # Backup storage directory
+  logs_dir             : ${logs_root:-not set}         # Log directory
+  retention_redundancy : ${retention_redundancy:-not set}   # Minimum full backups to retain
+  retention_window     : ${retention_window:-not set}  # Recovery window in days
+  db_port              : ${db_port:-not set}           # Database port
+  instance_name        : ${instance_name:-not set}     # Database instance name
+  compress_level       : ${compress_level:-not set}    # Zlib compression level (0-9)
+  retention_days       : ${retention_days:-not set}    # WAL archive retention days
+  archive_dir          : ${archive_dir:-not set}       # WAL archive location
+
+Remote Configuration:
+  remote_host          : ${remote_host:-not set}       # Remote DB host IP
+  remote_user          : ${remote_user:-not set}       # SSH user for remote
+  remote_port          : ${remote_port:-not set}       # SSH port for remote
+  dbauser              : ${dbauser:-not set}            # DB admin user
+  dbpasswd             : ******                        # DB admin password
+
+==================================================================
+Examples:
+  $ gbpbackup init --remote
+  $ gbpbackup set-config
+  $ gbpbackup backup full
+  $ gbpbackup delete -i ROT7F9
+  $ gbpbackup archive clean
+EOF
+    exit 1
+}
+
+########################################
+# Script Basic Functions
+########################################
+# v3.8 Tag: Structured logging functions with timestamp and severity levels
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SCRIPT] [INFO] : $*"
+}
+
+log_warn() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SCRIPT] [WARN] : $*"
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SCRIPT] [ERROR] : $*" >&2
+}
+
+log_ok() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SCRIPT] [SUCCESS] : $*"
+}
+
+# Logging Setup function
+setup_logging() {
+    local operation_type=$1
+    local sub_type=${2:-}
+
+    # Create log root directory
+    mkdir -p "$logs_root"
+
+    # v3.5 Tag: Automatic deletion of expired logs
+    # v4.0 Tag: By comparing before and after using `wc -l`, clearly output "removed: N files".
+    if [[ "$log_retention_time" =~ ^[0-9]+$ ]] && [[ "$log_retention_time" -gt 0 ]]; then
+        log_info "Cleaning up logs older than $log_retention_time days..."
+        
+        local file_count_before file_count_after removed_count
+        file_count_before=$(find "$logs_root" -type f -name "*.log" 2>/dev/null | wc -l) || true
+        
+        find "$logs_root" -type f -name "*.log" -mtime +"$log_retention_time" -delete 2>/dev/null || true
+        find "$logs_root" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        
+        file_count_after=$(find "$logs_root" -type f -name "*.log" 2>/dev/null | wc -l) || true
+        removed_count=$(( file_count_before - file_count_after ))
+        
+        log_ok "Log cleanup completed (retention: ${log_retention_time} days, removed: ${removed_count} files)"
+    fi
+
+    # v3.3 Tag: Define log path based on operation type
+    local logpath
+    case "$operation_type" in
+        init|set-config)
+            logpath="${logs_root}/init"
+            ;;
+        backup)
+            logpath="${logs_root}/backup"
+            ;;
+        delete|checkexpired)
+            logpath="${logs_root}/delete"
+            operation_type="delete"
+            ;;
+        validate)
+            logpath="${logs_root}/validate"
+            ;;
+        archive)
+            logpath="${logs_root}/archive"
+            ;;
+        show|show-config|show-profile)
+            logpath="${logs_root}/show"
+            operation_type="show"
+            ;;
+        *)
+            logpath="${logs_root}/main"
+            ;;
+    esac
+
+    mkdir -p "$logpath"
+    # v3.4 Tag: Log filename: YYYYMMDD.log
+    local log_date log_suffix log_file
+    log_date=$(date +%Y%m%d)
+    log_suffix="${operation_type}"
+    [[ -n "$sub_type" ]] && log_suffix+="_${sub_type}"
+    log_file="${logpath}/${log_suffix}_${log_date}.log"
+    exec > >(tee -a "$log_file") 2>&1
+
+    log_info "========================================================="
+    log_info " gbpbackup [$operation_type${sub_type:+:$sub_type}] started at $(date) "
+    log_info " Log file: $log_file"
+    log_info "========================================================="
+}
+
+check_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        log_error "This script must not be executed by root user."
+        log_info "Please switch to the user account designated for installing the database on the operating system."
+        exit 1
+    fi
+}
+
+run_cmd() {
+    log_info "Executing: $*"
+    "$@" || { log_error "Command failed: $*"; exit 1; }
+}
+
+########################################
+# Logic verification and helper functions
+########################################
+# v3.7 Tag: Validate remote parameters
+check_use_remote() {
+    if [[ "${use_remote:-false}" == "true" ]]; then
+        [[ -z "${remote_host:-}" || -z "${remote_user:-}" || -z "${dbauser:-}" || -z "${dbpasswd:-}" ]] && {
+            log_error "Remote mode requires remote_host, remote_user, dbauser and dbpasswd"
+            exit 1
+        }
+        [[ -z "${remote_port:-}" ]] && remote_port=22
+    fi
+    return 0
+}
+
+# v3.7 Tag: Build remote parameter strings
+build_remote_params() {
+    local param_type="${1:-}"
+
+    [[ "${use_remote:-false}" != "true" ]] && return 0
+
+    case "$param_type" in
+        conn)
+            echo "-h ${remote_host} -U ${dbauser} -W ${dbpasswd}"
+            ;;
+        remote)
+            echo "--remote-host=${remote_host} --remote-user=${remote_user} --remote-port=${remote_port:-22}"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+# v3.5 Tag: Dynamically construct compression parameters.
+# Returns a space-separated option string; callers use read -ra to make a real array.
+# Fix v4.0: internal default aligned to global compress_level default (5, not 7).
+build_compress_args() {
+    local level="${compress_level:-5}"
+    if [[ "$level" -gt 0 ]]; then
+        echo "--compress-algorithm zlib --compress-level $level"
+    else
+        echo "--compress-algorithm none --compress-level 1"
+    fi
+}
+
+# Check the database connectivity and primary/standby role.
+# Stores data_directory in _GBP_DATA_DIR for callers that need it.
+check_db() {
+    # v3.6 Tag: Add parameter to skip primary/standby check for init command
+    local skip_primary_check=${1:-false}
+
+    # Fix v4.0: split local + $() to correctly propagate exit code under set -e
+    local conn_params
+    conn_params=$(build_remote_params conn)
+
+    log_info "Connecting to database on port ${db_port} to fetch data_directory..."
+    local _data_dir
+    _data_dir=$(gsql -d postgres -p "${db_port}" ${conn_params} -At -c "show data_directory;")
+    [[ -z "$_data_dir" ]] && { log_error "Failed to fetch data_directory: DB connection failed"; exit 1; }
+    log_ok "Successfully fetched data_directory: ${_data_dir}"
+
+    # v3.4/v3.6 Tag: Skip primary check for standby backup mode or explicit skip
+    if [[ "${is_standby_backup}" == "true" ]] || [[ "$skip_primary_check" == "true" ]]; then
+        log_info "Skipping primary node role check (skip_flag=${skip_primary_check}, standby_mode=${is_standby_backup})"
+    else
+        log_info "Checking database primary/standby role..."
+        local in_recovery
+        in_recovery=$(gsql -d postgres -p "${db_port}" ${conn_params} -At -c "select pg_is_in_recovery();")
+
+        if [[ "$in_recovery" == "t" ]]; then
+            log_error "Role check failed: Standby node detected"
+            exit 1
+        fi
+
+        log_ok "Successfully confirmed database role: Primary node"
+    fi
+
+    log_info "========================================================="
+    log_ok "Check Database Connectivity Completed"
+    log_info "========================================================="
+
+    # Return data_dir to caller via explicit global (avoids polluting
+    # stdout, which carries log output that $() would capture).
+    _GBP_DATA_DIR="$_data_dir"
+}
+
+# v3.6 Tag: Core logic of set-config (shared by init and set-config commands)
+_set_config_impl() {
+    # Fix v4.0: split local + $() and use real array via read -ra
+    local compress_str
+    compress_str=$(build_compress_args)
+    local -a compress_args
+    read -ra compress_args <<< "$compress_str"
+
+    run_cmd gs_probackup set-config \
+        -B "${backups_dir}" \
+        --instance "${instance_name}" \
+        --retention-redundancy "${retention_redundancy}" \
+        --retention-window "${retention_window}" \
+        "${compress_args[@]}"
+}
+
+# v3.7 Tag: Check if a valid FULL backup exists within the last 7 days
+# Returns 0 if valid base backup found; 1 if full backup required
+has_valid_backup() {
+    local instance="${1:-$instance_name}"
+
+    if ! command -v python3 &>/dev/null; then
+        log_warn "Python3 not found, using basic check (no time validation)"
+        local count
+        count=$(gs_probackup show -B "$backups_dir" --instance "$instance" 2>/dev/null | \
+            awk 'NR>2 && /FULL/ && ($NF=="OK" || $NF=="DONE") {count++} END {print count+0}')
+        [[ "$count" -gt 0 ]]
+        return $?
+    fi
+
+    # v3.8 Tag: Python logging format synchronized with bash style
+    export _GBP_BACKUP_DIR="$backups_dir"
+    export _GBP_INSTANCE="$instance"
+
+    log_info "Checking backup validity (python3) ..."
+    python3 << 'EOF'
+import json
+import sys
+import subprocess
+import os
+import re
+from datetime import datetime, timezone, timedelta
+
+def log(msg, level="INFO"):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [SCRIPT] [{level}] : {msg}", file=sys.stderr)
+
+try:
+    backups_dir = os.environ.get("_GBP_BACKUP_DIR")
+    instance = os.environ.get("_GBP_INSTANCE")
+
+    result = subprocess.run([
+        "gs_probackup", "show", "-B", backups_dir,
+        "--instance", instance, "--format=json"
+    ], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        log("Failed to get backup list from gs_probackup", "ERROR")
+        sys.exit(2)
+
+    data = json.loads(result.stdout)
+
+    if not data or len(data) == 0 or not data[0].get("backups"):
+        log("No backups found in repository", "WARN")
+        sys.exit(1)
+
+    backups = data[0]["backups"]
+
+    # Filter FULL backups with OK status
+    full_backups = [
+        b for b in backups
+        if b.get("backup-mode") == "FULL" and b.get("status") == "OK"
+    ]
+
+    if not full_backups:
+        log("No valid FULL backup found (require status=OK)", "WARN")
+        sys.exit(1)
+
+    # Obtain the latest FULL backup (sorted by end-time)
+    latest = max(full_backups, key=lambda x: x.get("end-time", ""))
+    end_time_str = latest.get("end-time", "")
+    backup_id = latest.get("id", "unknown")
+
+    # Parse time format: 2026-04-10 15:25:56 +08
+    match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})([+-]\d{2})?", end_time_str)
+    if not match:
+        log(f"Cannot parse backup time: {end_time_str}", "ERROR")
+        sys.exit(2)
+
+    time_str = match.group(1)
+    tz_offset = match.group(2) or "+00"
+
+    backup_dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+    tz_hours = int(tz_offset)
+    backup_dt = backup_dt.replace(tzinfo=timezone(timedelta(hours=tz_hours)))
+
+    now = datetime.now(timezone.utc)
+    backup_utc = backup_dt.astimezone(timezone.utc)
+    diff = now - backup_utc
+    days_old = diff.days
+
+    if days_old > 7:
+        log(f"Latest FULL backup {backup_id} is {days_old} days old (limit: 7 days), need new full backup", "WARN")
+        sys.exit(1)
+
+    log(f"Valid FULL backup {backup_id} found ({days_old} days old, within 7 days limit)", "INFO")
+    sys.exit(0)
+
+except Exception as e:
+    log(f"Error checking backup validity: {e}", "ERROR")
+    sys.exit(2)
+EOF
+
+    local _py_rc=$?
+    [[ $_py_rc -ge 2 ]] && log_error "Backup validity check encountered an internal error (python3 exit code: $_py_rc)"
+	log_info "========================================================="
+    log_ok "Backup validity check completed (exit code: $_py_rc)"
+	log_info "========================================================="
+    return $_py_rc
+}
+
+########################################
+# Basic Usage Functions
+########################################
+cmd_show() {
+    [[ $# -ne 0 ]] && { log_error "'show' does not take arguments"; usage; }
+    setup_logging "show" "backups"
+    run_cmd gs_probackup show -B "$backups_dir" --instance "$instance_name"
+    log_info "========================================================="
+    log_ok " Show backups completed"
+    log_info "========================================================="
+}
+
+cmd_show_config() {
+    [[ $# -ne 0 ]] && { log_error "'show-config' does not take arguments"; usage; }
+    setup_logging "show" "config"
+    run_cmd gs_probackup show-config -B "$backups_dir" --instance "$instance_name"
+    log_info "========================================================="
+    log_ok " Show config completed"
+    log_info "========================================================="
+}
+
+cmd_show_profile() {
+    [[ $# -ne 0 ]] && { log_error "'show-profile' does not take arguments"; usage; }
+    setup_logging "show" "profile"
+    log_info "========================================================="
+    log_ok " Active Profile Settings"
+    log_info "========================================================="
+    [[ -f "$profile_file" ]] && cat "$profile_file" || log_error "No profile found"
+    log_info "========================================================="
+}
+
+cmd_validate() {
+    [[ $# -ne 0 ]] && { log_error "'validate' does not take arguments"; usage; }
+    # v3.7 Tag: Set up logs only when called independently
+    if [[ -z "${GBPBACKUP_LOG_CONTEXT:-}" ]]; then
+        setup_logging "validate" ""
+    fi
+    run_cmd gs_probackup validate -B "$backups_dir" --instance "$instance_name" -j "$backup_threads"
+    log_info "========================================================="
+    log_ok "Validate backups completed"
+    log_info "========================================================="
+}
+
+cmd_checkexpired() {
+    [[ $# -ne 0 ]] && { log_error "'checkexpired' does not take arguments"; usage; }
+    # v3.7 Tag: Set up logs only when called independently
+    if [[ -z "${GBPBACKUP_LOG_CONTEXT:-}" ]]; then
+        setup_logging "delete" "expired"
+    fi
+    run_cmd gs_probackup delete -B "$backups_dir" --instance "$instance_name" -j "$backup_threads" --delete-expired 
+    log_info "========================================================="
+    log_ok "Expired backups cleaned"
+    log_info "========================================================="
+}
+
+# v3.6 Tag: Independent set-config command
+cmd_set_config() {
+    [[ $# -ne 0 ]] && { log_error "'set-config' does not take arguments"; usage; }
+    # Write to init log when called independently
+    
+    # v4.0 Tag: Reload the configuration file before performing the backup.
+    if [[ -z "${GBPBACKUP_LOG_CONTEXT:-}" ]]; then
+        setup_logging "init" "set-config"
+    fi
+    log_info "Setting backup configuration..."
+    _set_config_impl
+    log_info "========================================================="
+    log_ok "Set config completed"
+    log_info "========================================================="
+}
+
+cmd_delete() {
+    [[ $# -lt 2 || "$1" != "-i" ]] && { log_error "Invalid delete syntax"; usage; }
+
+    local backupid="$2"
+    shift 2
+
+    [[ -z "$backupid" ]] && { log_error "Missing backup ID"; usage; }
+
+    setup_logging "delete" "manual"
+    run_cmd gs_probackup delete \
+        -B "$backups_dir" \
+        --instance "$instance_name" \
+        -j "$backup_threads" \
+        -i "$backupid"
+
+    log_info "========================================================="
+    log_ok "Backup $backupid deleted"
+    log_info "========================================================="
+}
+
+########################################
+# Core Functions
+########################################
+cmd_init() {
+    local use_remote=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remote) use_remote=true; shift ;;
+            *) log_error "Invalid argument: $1"; usage ;;
+        esac
+    done
+
+    # v3.7 Tag: Verify remote parameters
+    check_use_remote
+
+    # Fix v4.0: use explicit [[ ]] conditional instead of $($use_remote && echo ...)
+    local mode_label
+    [[ "$use_remote" == "true" ]] && mode_label="remote" || mode_label="local"
+    setup_logging "init" "$mode_label"
+
+    # v3.6 Tag: Pass true to skip primary/standby check during init.
+    # check_db stores the discovered data_directory in _GBP_DATA_DIR.
+    local data_dir
+    check_db "true"
+    data_dir="${_GBP_DATA_DIR:-}"
+
+    run_cmd gs_probackup init -B "$backups_dir"
+
+    # Fix v4.0: split local + $()
+    local remote_params
+    remote_params=$(build_remote_params remote)
+
+    run_cmd gs_probackup add-instance \
+        -B "$backups_dir" \
+        -D "$data_dir" \
+        --instance "$instance_name" \
+        ${remote_params:+${remote_params}}
+
+    _set_config_impl
+
+    log_info "========================================================="
+    [[ "$use_remote" == "true" ]] && log_ok "Initialization completed (Remote)" || log_ok "Initialization completed (Local)"
+    log_info "========================================================="
+}
+
+cmd_backup() {
+    [[ $# -lt 1 ]] && { log_error "'backup' requires at least one argument"; usage; }
+
+    local mode="$1"
+    shift
+    local use_remote=false
+    local -x GBPBACKUP_LOG_CONTEXT="backup"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remote) use_remote=true; shift ;;
+            *) log_error "Invalid argument: $1"; usage ;;
+        esac
+    done
+
+    # v3.7 Tag: Verify remote parameters
+    check_use_remote
+
+    # Fix v4.0: explicit conditional for log suffix
+    local remote_suffix=""
+    [[ "$use_remote" == "true" ]] && remote_suffix="_remote"
+    setup_logging "backup" "${mode}${remote_suffix}"
+    
+    # v3.7 Tag: Auto-switch to full if no valid incremental base exists
+    local backup_type=""
+    local actual_mode="$mode"
+    case "$mode" in
+        full)
+            backup_type="full"
+            ;;
+        increment)
+            if has_valid_backup; then
+                backup_type="ptrack"
+                log_info "Valid base backup found within 7 days, performing incremental backup"
+            else
+                log_warn "No valid base backup within 7 days (switching to FULL backup automatically)"
+                backup_type="full"
+                actual_mode="full"
+            fi
+            ;;
+        *)
+            log_error "Invalid backup type: $mode"
+            usage
+            ;;
+    esac
+    # v3.7 Tag: Record the actual backup type executed
+    log_info "Executing backup mode: $backup_type (requested: $mode, actual: $actual_mode)"
+
+    # v3.6 Tag: Acquire local lock for backup
+    # v4.1 Tag: Use <> to open without truncation (preserves old PID for error message).
+    # After acquiring the lock, write PID cleanly via separate > (truncates without
+    # affecting the flock on fd 200). Use head -1 to read only the first line.
+    exec 200<>"$lock_file"
+    if ! flock -n 200; then
+        log_error "gbpbackup backup already running (lock held by PID: $(head -1 "$lock_file" 2>/dev/null || echo unknown))"
+        exit 1
+    fi
+    echo $$ > "$lock_file"
+    
+    # v3.4 Tag: Check DB is up and is primary
+    check_db
+    
+    # v4.0 Tag: Synchronize current config to gs_probackup before backup,
+    # so that any profile changes are applied even if the user forgot set-config.
+    log_info "Synchronizing configuration to gs_probackup (set-config)..."
+    cmd_set_config
+
+    # Fix v4.0: split local + $() and use real array via read -ra
+    local compress_str
+    compress_str=$(build_compress_args)
+    local -a compress_args
+    read -ra compress_args <<< "$compress_str"
+
+    # Fix v4.0: split local + $()
+    local conn_params
+    conn_params=$(build_remote_params conn)
+    local remote_params
+    remote_params=$(build_remote_params remote)
+
+    run_cmd gs_probackup backup \
+        -B "${backups_dir}" \
+        -b "${backup_type}" \
+        --instance "${instance_name}" \
+        -p "${db_port}" \
+        -d postgres \
+        -j "${backup_threads}" \
+        "${compress_args[@]}" \
+        ${conn_params:+${conn_params}} \
+        ${remote_params:+${remote_params}}
+
+    log_info "========================================================="
+    log_ok "${backup_type} backup completed"
+    log_info "========================================================="
+    # v3.7 Tag: Set context flag to prevent nested functions from switching logs
+    log_info "Validating backup..."
+    cmd_validate
+    log_info "Cleaning expired backups..."
+    cmd_checkexpired
+
+    log_info "========================================================="
+    # Fix v4.0: explicit conditional
+    if [[ "$use_remote" == "true" ]]; then
+        log_ok "$actual_mode Backup process has been completed. (Remote)"
+    else
+        log_ok "$actual_mode Backup process has been completed. (Local)"
+    fi
+    log_info "========================================================="
+    trap 'rm -f "$lock_file"' EXIT
+}
+
+# Archive Cleanup with file count statistics
+cmd_archive_clean() {
+    [[ $# -ne 0 ]] && {
+        log_error "'archive clean' does not take additional arguments"
+        usage
+    }
+
+    setup_logging "archive" "clean"
+    log_info "Starting archive cleanup (retention: ${retention_days} days)..."
+
+    [[ ! -d "$archive_dir" ]] && {
+        log_error "Archive directory not found: $archive_dir"
+        exit 1
+    }
+
+    # GAUSSHOME must be set to locate pg_archivecleanup.
+    # Using ${GAUSSHOME:-} (not bare $GAUSSHOME) prevents set -u unbound variable error.
+    if [[ -z "${GAUSSHOME:-}" ]]; then
+        log_error "GAUSSHOME is not set; cannot locate pg_archivecleanup"
+        exit 1
+    fi
+    local PG_ARCHIVE_CLEANUP="${GAUSSHOME}/bin/pg_archivecleanup"
+    [[ ! -x "$PG_ARCHIVE_CLEANUP" ]] && {
+        log_error "pg_archivecleanup not found or not executable: $PG_ARCHIVE_CLEANUP"
+        exit 1
+    }
+
+    # v3.9 Tag: Date-aligned retention with adaptive backup selection
+    local current_epoch current_date cutoff_date cutoff_epoch cutoff_day_start cutoff_day_end
+
+    current_epoch=$(date +%s)
+    current_date=$(date -d "@${current_epoch}" '+%Y-%m-%d')
+    cutoff_date=$(date -d "${current_date} - ${retention_days} days" '+%Y-%m-%d')
+    cutoff_epoch=$(date -d "${cutoff_date}" +%s)
+    cutoff_day_start=$cutoff_epoch
+    cutoff_day_end=$(( cutoff_epoch + 86400 ))
+
+    local TARGET_BACKUP=""
+    # v3.9 Tag: Extracted base WAL segment name (first 24 hex chars of .backup filename)
+    local BASELINE_WAL=""
+    local selected_mtime=""
+
+    log_info "Current time       : $current_date $(date -d "@${current_epoch}" '+%H:%M:%S')"
+    log_info "Retention policy   : ${retention_days} calendar days"
+    log_info "Cutoff date        : $cutoff_date (00:00:00 - 23:59:59)"
+    log_info "Preserve from      : $(date -d "@$(( cutoff_epoch + 86400 ))" '+%Y-%m-%d') 00:00:00 onwards"
+
+    # v3.9 Tag: Search .backup files on the cutoff date (00:00 - 23:59), pick the latest
+    local file filename mtime mtime_date
+    while IFS= read -r -d '' file; do
+        filename=$(basename "$file")
+        mtime=$(stat -c %Y "$file")
+        mtime_date=$(date -d "@${mtime}" '+%Y-%m-%d')
+
+        if [[ "$mtime_date" == "$cutoff_date" ]]; then
+            TARGET_BACKUP="$filename"
+            selected_mtime=$mtime
+            # Extract WAL segment name: first 24 hex characters
+            BASELINE_WAL="${filename:0:24}"
+        fi
+    done < <(find "$archive_dir" -maxdepth 1 -type f -name "*.backup" -print0 | sort -z)
+
+    # v3.9 Tag: If no .backup on cutoff day, search backwards for the most recent one before it
+    if [[ -z "$TARGET_BACKUP" ]]; then
+        log_warn "No .backup found on $cutoff_date, searching backwards..."
+
+        while IFS= read -r -d '' file; do
+            filename=$(basename "$file")
+            mtime=$(stat -c %Y "$file")
+
+            if (( mtime < cutoff_day_start )); then
+                TARGET_BACKUP="$filename"
+                selected_mtime=$mtime
+                BASELINE_WAL="${filename:0:24}"
+                break
+            fi
+        done < <(find "$archive_dir" -maxdepth 1 -type f -name "*.backup" -print0 | sort -rz)
+    fi
+
+    if [[ -z "$TARGET_BACKUP" ]]; then
+        log_info "No suitable baseline backup found for retention policy; nothing to clean"
+        log_info "========================================================="
+        log_ok "Archive cleanup completed (no action taken)"
+        log_info "========================================================="
+        exit 0
+    fi
+
+    # v3.9 Tag: Verify the extracted WAL name format (must be 24 hex chars)
+    if [[ ${#BASELINE_WAL} -ne 24 ]] || [[ ! "$BASELINE_WAL" =~ ^[0-9A-Fa-f]{24}$ ]]; then
+        log_error "Failed to extract valid WAL segment name from: $TARGET_BACKUP"
+        exit 1
+    fi
+
+    log_info "Selected baseline  : $TARGET_BACKUP"
+    log_info "Baseline mtime     : $(date -d "@${selected_mtime}" '+%Y-%m-%d %H:%M:%S')"
+    log_info "Baseline WAL       : $BASELINE_WAL"
+    log_info "Action             : Remove all WAL segments OLDER than $BASELINE_WAL"
+
+    # v4.0 Feature: Count files before and after cleanup for statistics
+    local before_count after_count removed_count
+    before_count=$(find "$archive_dir" -maxdepth 1 -type f | wc -l)
+
+    run_cmd "$PG_ARCHIVE_CLEANUP" "$archive_dir" "$BASELINE_WAL"
+
+    after_count=$(find "$archive_dir" -maxdepth 1 -type f | wc -l)
+    removed_count=$(( before_count - after_count ))
+
+    log_info "---------------------------------------------------------"
+    log_info "Archive cleanup statistics:"
+    log_info "  Files before cleanup : $before_count"
+    log_info "  Files after cleanup  : $after_count"
+    log_info "  Files removed        : $removed_count"
+    log_info "---------------------------------------------------------"
+    log_info "========================================================="
+    log_ok "Archive cleanup completed"
+    log_info "========================================================="
+}
+
+########################################
+# Main Command Dispatcher
+########################################
+check_user
+
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+case "${1}" in
+    init)
+        shift
+        cmd_init "$@"
+        ;;
+    set-config)
+        shift
+        cmd_set_config "$@"
+        ;;
+    backup)
+        shift
+        cmd_backup "$@"
+        ;;
+    archive)
+        shift
+        if [[ "${1:-}" == "clean" ]]; then
+            shift
+            cmd_archive_clean "$@"
+        else
+            log_error "Invalid archive sub-command: ${1:-<empty>}"
+            usage
+        fi
+        ;;
+    delete)
+        shift
+        cmd_delete "$@"
+        ;;
+    checkexpired)
+        shift
+        cmd_checkexpired "$@"
+        ;;
+    validate)
+        shift
+        cmd_validate "$@"
+        ;;
+    show)
+        shift
+        cmd_show "$@"
+        ;;
+    show-config)
+        shift
+        cmd_show_config "$@"
+        ;;
+    show-profile)
+        shift
+        cmd_show_profile "$@"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        log_error "Unknown command: $1"
+        usage
+        ;;
+esac
+
+log_info "========================================================="
+log_ok " gbpbackup finished at $(date) "
+log_info "========================================================="

@@ -1,0 +1,6 @@
+﻿*.log
+*.tmp
+*.swp
+*~
+.bash_history
+.viminfo
